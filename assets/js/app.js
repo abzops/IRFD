@@ -1622,6 +1622,17 @@ async function handleSignUp(event) {
 
     const user = data.user;
     if (user) {
+      // Check if user already exists (identities array is empty in Supabase)
+      if (user.identities && user.identities.length === 0) {
+        state.busy = false;
+        state.toast = { 
+          type: "error", 
+          message: "This username/email is already registered. Please go to the Login tab or choose a different username." 
+        };
+        render();
+        return;
+      }
+
       // 1. Create Organization
       const { data: orgData, error: orgError } = await state.client
         .from("organizations")
