@@ -61,7 +61,8 @@ const state = {
   insightsExpanded: localStorage.getItem(INSIGHTS_KEY) === "true",
   detailTab: "overview",
   activities: [],
-  authMode: "login"
+  authMode: "login",
+  showDevConfig: false
 };
 
 // Initial theme application to prevent flash of wrong colors
@@ -149,6 +150,11 @@ function getStoredConfig() {
 
 function hasSupabaseConfig(config) {
   return Boolean(config.url && config.anonKey && !config.url.includes("YOUR_") && !config.anonKey.includes("YOUR_"));
+}
+
+function isProductionConfigured() {
+  const inline = window.IRFD_SUPABASE || {};
+  return Boolean(inline.url && inline.anonKey && !inline.url.includes("YOUR_") && !inline.anonKey.includes("YOUR_"));
 }
 
 async function loadData() {
@@ -433,30 +439,34 @@ function render() {
 }
 
 function renderSetup() {
+  const showDev = state.showDevConfig;
   app.innerHTML = `
     <main class="auth-page">
       <section class="auth-panel">
         <div class="brand-mark"><img src="./assets/images/logo.png" alt="IRFD Logo"></div>
-        <h1>IRFD Setup</h1>
-        <p class="muted">Connect your Supabase project to start using staff login and live renewal data.</p>
+        <h1>Portal Setup Required</h1>
+        <p class="muted">This portal is not yet connected to a live database. Please configure your Supabase connection parameters in your <code>index.html</code> script block to activate this service.</p>
         
         ${renderToast()}
         
-        <form id="config-form" class="stack-form">
-          <label>
-            <span>Supabase URL</span>
-            <input name="url" type="url" placeholder="https://project.supabase.co" required>
-          </label>
-          <label>
-            <span>Anon public key</span>
-            <textarea name="anonKey" rows="3" placeholder="Paste your anon public key" required></textarea>
-          </label>
-          <button class="primary-btn" type="submit"><i data-lucide="plug"></i><span>Save Connection</span></button>
-        </form>
-        
-        <div class="auth-actions">
-          <button class="ghost-btn" type="button" data-action="preview-demo"><i data-lucide="monitor-play"></i><span>Preview Demo Mode</span></button>
-        </div>
+        ${showDev ? `
+          <form id="config-form" class="stack-form" style="margin-top: 20px;">
+            <label>
+              <span>Supabase URL</span>
+              <input name="url" type="url" placeholder="https://project.supabase.co" required>
+            </label>
+            <label>
+              <span>Anon public key</span>
+              <textarea name="anonKey" rows="3" placeholder="Paste your anon public key" required></textarea>
+            </label>
+            <button class="primary-btn" type="submit"><i data-lucide="plug"></i><span>Save Connection</span></button>
+          </form>
+        ` : `
+          <div class="auth-actions" style="margin-top: 20px; gap: 8px; flex-direction: column; width: 100%;">
+            <button class="primary-btn" type="button" data-action="preview-demo" style="width: 100%;"><i data-lucide="monitor-play"></i><span>Preview Demo Mode</span></button>
+            <button class="ghost-btn" type="button" data-action="toggle-dev-config" style="width: 100%;"><i data-lucide="settings"></i><span>Developer Configuration</span></button>
+          </div>
+        `}
       </section>
     </main>
   `;
@@ -510,8 +520,10 @@ function renderAuth() {
         `}
 
         <div class="auth-actions">
-          <button class="ghost-btn" type="button" data-action="preview-demo"><i data-lucide="monitor-play"></i><span>Bypass to Demo Mode</span></button>
-          <button class="ghost-btn" type="button" data-action="clear-config"><i data-lucide="settings"></i><span>Change Connection</span></button>
+          ${isProductionConfigured() ? "" : `
+            <button class="ghost-btn" type="button" data-action="preview-demo"><i data-lucide="monitor-play"></i><span>Bypass to Demo Mode</span></button>
+            <button class="ghost-btn" type="button" data-action="clear-config"><i data-lucide="settings"></i><span>Change Connection</span></button>
+          `}
         </div>
       </section>
     </main>
@@ -1414,6 +1426,11 @@ function bindCommonEvents() {
 
 async function handleAction(event) {
   const action = event.currentTarget.dataset.action;
+  if (action === "toggle-dev-config") {
+    state.showDevConfig = !state.showDevConfig;
+    render();
+    return;
+  }
   if (action === "preview-demo") enableDemoMode();
   if (action === "clear-config") {
     localStorage.removeItem(CONFIG_KEY);
