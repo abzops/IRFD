@@ -36,7 +36,8 @@ const navItems = [
   { id: "renewed", label: "Renewed Policies", icon: "badge-check" },
   { id: "lost", label: "Lost Leads", icon: "circle-off" },
   { id: "reports", label: "Reports", icon: "bar-chart-3" },
-  { id: "activity", label: "Activity Log", icon: "activity" }
+  { id: "activity", label: "Activity Log", icon: "activity" },
+  { id: "team", label: "Team Settings", icon: "users" }
 ];
 
 const state = {
@@ -62,7 +63,9 @@ const state = {
   detailTab: "overview",
   activities: [],
   authMode: "login",
-  showDevConfig: false
+  showDevConfig: false,
+  profile: null,
+  teamProfiles: []
 };
 
 // Initial theme application to prevent flash of wrong colors
@@ -100,22 +103,29 @@ async function init() {
     state.client = createClient(config.url, config.anonKey);
     const { data } = await state.client.auth.getSession();
     state.session = data.session;
-    state.mode = state.session ? "app" : "auth";
 
     state.client.auth.onAuthStateChange(async (_event, session) => {
       const isLoggingIn = !state.session && session;
       state.session = session;
       state.mode = session ? "app" : "auth";
       if (session) {
+        await loadProfile();
         await loadData();
         if (isLoggingIn) {
           logActivity("Staff Login", `Session started for ${session.user.email}`);
         }
+      } else {
+        state.profile = null;
+        state.teamProfiles = [];
       }
       render();
     });
 
-    if (state.session) await loadData();
+    if (state.session) {
+      await loadProfile();
+      await loadData();
+    }
+    state.mode = state.session ? "app" : "auth";
     render();
     return;
   }
@@ -127,6 +137,34 @@ async function init() {
 
   state.mode = "setup";
   render();
+}
+
+async function loadProfile() {
+  if (!state.client || !state.session) return;
+  try {
+    const { data, error } = await state.client
+      .from("profiles")
+      .select("*, organizations(name)")
+      .eq("id", state.session.user.id)
+      .maybeSingle();
+
+    if (error) throw error;
+    state.profile = data;
+
+    // Load teammate profiles if user is admin
+    if (data && data.role === "admin") {
+      const { data: team, error: teamErr } = await state.client
+        .from("profiles")
+        .select("*")
+        .order("created_at", { ascending: true });
+      if (!teamErr) {
+        state.teamProfiles = team || [];
+      }
+    }
+  } catch (err) {
+    console.error("Failed to load profile:", err);
+    state.toast = { type: "error", message: `Profile error: ${err.message}` };
+  }
 }
 
 function getRouteFromHash() {
@@ -214,6 +252,11 @@ function enableDemoMode() {
   state.followups = snapshot.followups;
   syncActivitiesWithFollowups();
   state.reportViews = null;
+  state.teamProfiles = [
+    { id: "1", full_name: "Asha Nair", role: "admin", created_at: "2026-06-01T09:00:00Z" },
+    { id: "2", full_name: "Ravi Kumar", role: "agent", created_at: "2026-06-02T10:00:00Z" },
+    { id: "3", full_name: "Neha Shah", role: "agent", created_at: "2026-06-03T11:00:00Z" }
+  ];
   render();
 }
 
@@ -504,18 +547,22 @@ function renderAuth() {
         ` : `
           <form id="signup-form" class="stack-form">
             <label>
-              <span>Username or Email</span>
-              <input name="email" type="text" placeholder="e.g. ssmotorsvrk" required>
+              <span>Organization Name</span>
+              <input name="orgName" type="text" placeholder="e.g. SS Motors" required>
             </label>
             <label>
-              <span>Executive Name</span>
+              <span>Admin Name</span>
               <input name="executive" type="text" placeholder="e.g. Ravi Kumar" required>
+            </label>
+            <label>
+              <span>Username or Email</span>
+              <input name="email" type="text" placeholder="e.g. ssmotorsvrk" required>
             </label>
             <label>
               <span>Password</span>
               <input name="password" type="password" placeholder="Min. 6 characters" required>
             </label>
-            <button class="primary-btn" type="submit" ${state.busy ? "disabled" : ""}><i data-lucide="user-plus"></i><span>${state.busy ? "Registering..." : "Register"}</span></button>
+            <button class="primary-btn" type="submit" ${state.busy ? "disabled" : ""}><i data-lucide="user-plus"></i><span>${state.busy ? "Registering..." : "Register Organization"}</span></button>
           </form>
         `}
 
@@ -544,7 +591,9 @@ function renderShell() {
           </div>
         </div>
         <nav class="nav-list">
-          ${navItems.map(renderNavItem).join("")}
+          ${navItems
+            .filter((item) => item.id !== "team" || state.mode === "demo" || (state.profile && state.profile.role === "admin"))
+            .map(renderNavItem).join("")}
         </nav>
       </aside>
       <div class="workspace">
@@ -569,7 +618,9 @@ function renderShell() {
             ? renderReports()
             : state.route === "activity"
               ? renderActivityLog()
-              : renderDashboardView()
+              : state.route === "team"
+                ? renderTeamSettings()
+                : renderDashboardView()
         }
       </div>
       ${selectedLead ? renderLeadDetail(selectedLead) : ""}
@@ -1360,6 +1411,7 @@ function bindCommonEvents() {
   document.querySelector("#signup-form")?.addEventListener("submit", handleSignUp);
   document.querySelector("#followup-form")?.addEventListener("submit", handleFollowupSubmit);
   document.querySelector("#lead-form")?.addEventListener("submit", handleLeadSubmit);
+  document.querySelector("#team-form")?.addEventListener("submit", handleAddStaff);
 
   document.querySelectorAll("[data-auth-mode]").forEach((button) => {
     button.addEventListener("click", () => {
@@ -1546,43 +1598,63 @@ async function handleSignUp(event) {
   const email = rawEmail.includes("@") ? rawEmail : `${rawEmail}@ssmotors.com`;
   const password = String(form.get("password") || "");
   const executive = String(form.get("executive") || "").trim();
+  const orgName = String(form.get("orgName") || "").trim();
+  const orgSlug = orgName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "") || `org-${Date.now()}`;
 
   if (!state.client) {
     // Simulate signup successfully if client is not connected
     setTimeout(() => {
       state.busy = false;
-      state.toast = { type: "success", message: `Registry override simulated! Registered profile for ${executive}.` };
+      state.toast = { type: "success", message: `Simulated registration for ${orgName} (${executive}).` };
       state.authMode = "login";
       render();
     }, 1200);
     return;
   }
 
-  const { data, error } = await state.client.auth.signUp({
-    email,
-    password,
-    options: {
-      data: {
-        assigned_executive: executive
-      }
-    }
-  });
+  try {
+    const { data, error } = await state.client.auth.signUp({
+      email,
+      password
+    });
 
-  if (error) {
+    if (error) throw error;
+
+    const user = data.user;
+    if (user) {
+      // 1. Create Organization
+      const { data: orgData, error: orgError } = await state.client
+        .from("organizations")
+        .insert({ name: orgName, slug: orgSlug })
+        .select()
+        .single();
+
+      if (orgError) throw orgError;
+
+      // 2. Create Profile
+      const { error: profileError } = await state.client
+        .from("profiles")
+        .insert({
+          id: user.id,
+          organization_id: orgData.id,
+          role: "admin",
+          full_name: executive
+        });
+
+      if (profileError) throw profileError;
+
+      state.busy = false;
+      state.toast = { type: "success", message: "Organization registered successfully!" };
+      state.session = data.session;
+      state.mode = "app";
+      await loadProfile();
+      await loadData();
+    }
+  } catch (error) {
     state.busy = false;
     state.toast = { type: "error", message: error.message };
-    render();
-  } else {
-    state.busy = false;
-    state.toast = { 
-      type: "success", 
-      message: data.user?.identities?.length === 0 
-        ? "Access registration successful. Check your email for validation instructions." 
-        : "Staff profile committed! Verification email has been transmitted." 
-    };
-    state.authMode = "login";
-    render();
   }
+  render();
 }
 
 async function handleFollowupSubmit(event) {
@@ -1844,4 +1916,154 @@ function exportActivitiesToCsv() {
   ]);
   const dateStr = new Date().toISOString().slice(0, 10);
   exportToCsv(`irfd_activity_log_${dateStr}.csv`, headers, rows);
+}
+
+function renderTeamSettings() {
+  if (state.mode !== "demo" && (!state.profile || state.profile.role !== "admin")) {
+    return `
+      <section class="table-surface" style="padding: 24px;">
+        <div class="empty-state">
+          <i data-lucide="shield-alert"></i>
+          <p>Access Denied. Administrative clearance required.</p>
+        </div>
+      </section>
+    `;
+  }
+
+  const orgName = state.mode === "demo" ? "Demo Workspace" : (state.profile?.organizations?.name || "Your Organization");
+  const profiles = state.teamProfiles || [];
+
+  return `
+    <div class="reports-container" style="display: grid; grid-template-columns: 1.5fr 1fr; gap: 24px; align-items: start;">
+      <section class="table-surface" style="margin: 0; padding: 24px;">
+        <div class="table-toolbar" style="padding: 0 0 20px; border-bottom: 1px solid var(--border-color); margin-bottom: 20px;">
+          <div>
+            <h2>${escapeHtml(orgName)} Directory</h2>
+            <p>${profiles.length} total staff members</p>
+          </div>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Full Name</th>
+                <th>Role</th>
+                <th>Joined</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${profiles.map(p => `
+                <tr>
+                  <td><strong>${escapeHtml(p.full_name)}</strong></td>
+                  <td><span class="priority-pill ${p.role === "admin" ? "high" : "low"}" style="padding: 3px 8px; font-size: 0.75rem;">${escapeHtml(p.role.toUpperCase())}</span></td>
+                  <td>${formatDate(p.created_at)}</td>
+                </tr>
+              `).join("")}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="table-surface" style="margin: 0; padding: 24px;">
+        <div class="table-toolbar" style="border-bottom: 1px solid var(--border-color); margin-bottom: 20px; padding-bottom: 12px;">
+          <div>
+            <h2>Add Team Member</h2>
+            <p>Create login credentials for new staff</p>
+          </div>
+        </div>
+        <form id="team-form" class="stack-form">
+          <label>
+            <span>Full Name</span>
+            <input name="staffName" type="text" placeholder="e.g. Asha Nair" required>
+          </label>
+          <label>
+            <span>Username or Email</span>
+            <input name="staffEmail" type="text" placeholder="e.g. asha" required>
+          </label>
+          <label>
+            <span>Password</span>
+            <input name="staffPassword" type="password" placeholder="Min. 6 characters" required>
+          </label>
+          <label>
+            <span>System Role</span>
+            <select name="staffRole" style="width: 100%; min-height: 40px; border-radius: 8px; border: 1px solid var(--border-color); background: var(--surface-hover); color: var(--text-main); padding: 0 12px; margin-top: 6px;">
+              <option value="agent">Agent (View & Follow-up leads)</option>
+              <option value="admin">Administrator (Add staff & settings)</option>
+            </select>
+          </label>
+          <button class="primary-btn" type="submit" ${state.busy ? "disabled" : ""} style="width: 100%; margin-top: 10px;">
+            <i data-lucide="user-plus"></i>
+            <span>${state.busy ? "Registering..." : "Add Teammate"}</span>
+          </button>
+        </form>
+      </section>
+    </div>
+  `;
+}
+
+async function handleAddStaff(event) {
+  event.preventDefault();
+  state.busy = true;
+  state.toast = null;
+  render();
+
+  const form = new FormData(event.currentTarget);
+  const name = String(form.get("staffName") || "").trim();
+  const rawEmail = String(form.get("staffEmail") || "").trim();
+  const email = rawEmail.includes("@") ? rawEmail : `${rawEmail}@ssmotors.com`;
+  const password = String(form.get("staffPassword") || "");
+  const role = String(form.get("staffRole") || "agent").trim();
+
+  if (state.mode === "demo") {
+    setTimeout(() => {
+      state.busy = false;
+      state.teamProfiles.push({
+        id: crypto.randomUUID(),
+        full_name: name,
+        role: role,
+        organization_id: "demo-org",
+        created_at: new Date().toISOString()
+      });
+      state.toast = { type: "success", message: `Demo: Added teammate ${name} (${role})` };
+      render();
+    }, 1000);
+    return;
+  }
+
+  try {
+    const config = getStoredConfig();
+    const tempClient = createClient(config.url, config.anonKey, {
+      auth: { persistSession: false }
+    });
+
+    const { data, error } = await tempClient.auth.signUp({
+      email,
+      password
+    });
+
+    if (error) throw error;
+
+    const user = data.user;
+    if (user) {
+      const { error: profileError } = await state.client
+        .from("profiles")
+        .insert({
+          id: user.id,
+          organization_id: state.profile.organization_id,
+          role: role,
+          full_name: name
+        });
+
+      if (profileError) throw profileError;
+
+      state.toast = { type: "success", message: `Successfully registered staff account for ${name}!` };
+      await loadProfile();
+    }
+  } catch (err) {
+    console.error("Failed to add staff member:", err);
+    state.toast = { type: "error", message: `Failed to add staff: ${err.message}` };
+  } finally {
+    state.busy = false;
+    render();
+  }
 }
