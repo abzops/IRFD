@@ -65,7 +65,10 @@ const state = {
   authMode: "login",
   showDevConfig: false,
   profile: null,
-  teamProfiles: []
+  teamProfiles: [],
+  workspace: localStorage.getItem("irfd.active.workspace") || "personal",
+  organizations: [],
+  activeOrgRole: null
 };
 
 // Initial theme application to prevent flash of wrong colors
@@ -142,24 +145,56 @@ async function init() {
 async function loadProfile() {
   if (!state.client || !state.session) return;
   try {
-    const { data, error } = await state.client
+    const { data: profData, error: profErr } = await state.client
       .from("profiles")
-      .select("*, organizations(name)")
+      .select("*")
       .eq("id", state.session.user.id)
       .maybeSingle();
 
-    if (error) throw error;
-    state.profile = data;
+    if (profErr) throw profErr;
+    state.profile = profData;
 
-    // Load teammate profiles if user is admin
-    if (data && data.role === "admin") {
-      const { data: team, error: teamErr } = await state.client
-        .from("profiles")
-        .select("*")
-        .order("created_at", { ascending: true });
-      if (!teamErr) {
-        state.teamProfiles = team || [];
+    // Fetch user's organizations
+    const { data: memberOrgs, error: orgsErr } = await state.client
+      .from("organization_members")
+      .select("role, organizations(*)")
+      .eq("user_id", state.session.user.id);
+
+    if (!orgsErr && memberOrgs) {
+      state.organizations = memberOrgs
+        .filter(mo => mo.organizations)
+        .map(mo => ({ ...mo.organizations, role: mo.role }));
+    } else {
+      state.organizations = [];
+    }
+
+    // Validate active workspace
+    const validWorkspace = state.workspace === "personal" || state.organizations.some(o => o.id === state.workspace);
+    if (!validWorkspace) {
+      state.workspace = "personal";
+      localStorage.setItem("irfd.active.workspace", "personal");
+    }
+
+    // Set active role
+    if (state.workspace !== "personal") {
+      state.activeOrgRole = state.organizations.find(o => o.id === state.workspace)?.role || null;
+      
+      // Load team profiles
+      const { data: teamData, error: teamErr } = await state.client
+        .from("organization_members")
+        .select("role, user_id, profiles(*)")
+        .eq("organization_id", state.workspace);
+      
+      if (!teamErr && teamData) {
+        state.teamProfiles = teamData
+          .filter(t => t.profiles)
+          .map(t => ({ ...t.profiles, role: t.role }));
+      } else {
+        state.teamProfiles = [];
       }
+    } else {
+      state.activeOrgRole = null;
+      state.teamProfiles = [];
     }
   } catch (err) {
     console.error("Failed to load profile:", err);
@@ -169,7 +204,8 @@ async function loadProfile() {
 
 function getRouteFromHash() {
   const value = window.location.hash.replace("#", "");
-  return navItems.some((item) => item.id === value) ? value : "overview";
+  const extraRoutes = ["profile", "settings", "personalization", "organization"];
+  return navItems.some((item) => item.id === value) || extraRoutes.includes(value) ? value : "overview";
 }
 
 function getStoredConfig() {
@@ -201,8 +237,16 @@ async function loadData() {
   render();
 
   try {
+    // Determine active workspace filter for renewals
+    let renewalsQuery = state.client.from("insurance_renewals_enriched").select("*");
+    if (state.workspace === "personal") {
+      renewalsQuery = renewalsQuery.is("organization_id", null);
+    } else {
+      renewalsQuery = renewalsQuery.eq("organization_id", state.workspace);
+    }
+
     const [renewalsResult, followupsResult] = await Promise.all([
-      state.client.from("insurance_renewals_enriched").select("*").order("policy_expiry_date", { ascending: true }),
+      renewalsQuery.order("policy_expiry_date", { ascending: true }),
       state.client.from("renewal_followups").select("*").order("followup_date", { ascending: false })
     ]);
 
@@ -210,11 +254,12 @@ async function loadData() {
     if (followupsResult.error) throw followupsResult.error;
 
     state.leads = renewalsResult.data || [];
-    state.followups = followupsResult.data || [];
     
-    // Sync activities list with the newly loaded followups database rows
+    // Filter followups in memory based on accessible leads in active workspace
+    const visibleLeadIds = new Set(state.leads.map(l => l.id));
+    state.followups = (followupsResult.data || []).filter(f => visibleLeadIds.has(f.renewal_id));
+
     syncActivitiesWithFollowups();
-    
     await loadReportViews();
     state.toast = null;
   } catch (error) {
@@ -253,10 +298,20 @@ function enableDemoMode() {
   syncActivitiesWithFollowups();
   state.reportViews = null;
   state.teamProfiles = [
-    { id: "1", full_name: "Asha Nair", role: "admin", created_at: "2026-06-01T09:00:00Z" },
-    { id: "2", full_name: "Ravi Kumar", role: "agent", created_at: "2026-06-02T10:00:00Z" },
-    { id: "3", full_name: "Neha Shah", role: "agent", created_at: "2026-06-03T11:00:00Z" }
+    { id: "1", full_name: "Asha Nair", role: "Admin", created_at: "2026-06-01T09:00:00Z" },
+    { id: "2", full_name: "Ravi Kumar", role: "Manager", created_at: "2026-06-02T10:00:00Z" },
+    { id: "3", full_name: "Neha Shah", role: "Staff Member", created_at: "2026-06-03T11:00:00Z" }
   ];
+  state.organizations = [
+    { id: "demo-org-1", name: "Demo Organization", slug: "demo-org", role: "Admin" }
+  ];
+  state.profile = {
+    id: "demo-user-id",
+    username: "demouser",
+    email: "demo@irfd.com",
+    full_name: "Demo User",
+    avatar_url: null
+  };
   render();
 }
 
@@ -553,22 +608,18 @@ function renderAuth() {
         ` : `
           <form id="signup-form" class="stack-form">
             <label>
-              <span>Organization Name</span>
-              <input name="orgName" type="text" placeholder="e.g. SS Motors" required>
+              <span>Name</span>
+              <input name="name" type="text" placeholder="e.g. Ravi Kumar" required>
             </label>
             <label>
-              <span>Admin Name</span>
-              <input name="executive" type="text" placeholder="e.g. Ravi Kumar" required>
-            </label>
-            <label>
-              <span>Username or Email</span>
-              <input name="email" type="text" placeholder="e.g. ssmotorsvrk" required>
+              <span>Email Address</span>
+              <input name="email" type="email" placeholder="e.g. ravi@example.com" required>
             </label>
             <label>
               <span>Password</span>
               <input name="password" type="password" placeholder="Min. 6 characters" required>
             </label>
-            <button class="primary-btn" type="submit" ${state.busy ? "disabled" : ""}><i data-lucide="user-plus"></i><span>${state.busy ? "Registering..." : "Register Organization"}</span></button>
+            <button class="primary-btn" type="submit" ${state.busy ? "disabled" : ""}><i data-lucide="user-plus"></i><span>${state.busy ? "Registering..." : "Register"}</span></button>
           </form>
         `}
 
@@ -596,6 +647,14 @@ function renderShell() {
             <span>Insurance Renewals</span>
           </div>
         </div>
+        <div class="workspace-switcher" style="padding: 0 16px 16px; border-bottom: 1px solid var(--line);">
+          <select id="workspace-select" style="width: 100%; min-height: 38px; border-radius: 8px; border: 1px solid var(--line); background: var(--surface-opaque); color: var(--ink); padding: 0 12px; font-weight: 600; font-size: 0.85rem;">
+            <option value="personal" ${state.workspace === "personal" ? "selected" : ""}>Personal Workspace</option>
+            ${state.organizations.map(org => `
+              <option value="${org.id}" ${state.workspace === org.id ? "selected" : ""}>${escapeHtml(org.name)}</option>
+            `).join("")}
+          </select>
+        </div>
         <nav class="nav-list">
           ${navItems
             .filter((item) => item.id !== "team" || state.mode === "demo" || (state.profile && state.profile.role === "admin"))
@@ -603,17 +662,28 @@ function renderShell() {
         </nav>
         
         ${state.profile || state.mode === "demo" ? `
-          <div class="sidebar-user" style="margin-top: auto; padding: 16px; border-top: 1px solid var(--border-color); display: flex; align-items: center; gap: 12px;">
-            <div class="avatar" style="width: 36px; height: 36px; border-radius: 50%; background: var(--bg-gradient); display: flex; align-items: center; justify-content: center; color: white; font-weight: bold; font-size: 0.85rem;">
-              ${(state.profile?.full_name || "Demo User").split(" ").map(n => n[0]).join("").toUpperCase().slice(0, 2)}
-            </div>
-            <div style="display: flex; flex-direction: column; overflow: hidden;">
-              <strong style="font-size: 0.85rem; color: var(--text-main); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">
-                ${escapeHtml(state.profile?.full_name || "Demo Administrator")}
-              </strong>
-              <span style="font-size: 0.75rem; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">
-                ${escapeHtml(state.profile?.organizations?.name || "Demo Org")} (${state.profile?.role || "admin"})
-              </span>
+          <div class="sidebar-user-container" style="margin-top: auto; border-top: 1px solid var(--line); position: relative; width: 100%;">
+            <button class="sidebar-user" id="profile-menu-toggle" type="button" style="width: 100%; padding: 16px; background: transparent; border: none; display: flex; align-items: center; gap: 12px; text-align: left; cursor: pointer;">
+              <div class="avatar" style="width: 36px; height: 36px; border-radius: 50%; background: var(--accent-gradient); display: flex; align-items: center; justify-content: center; color: white; font-weight: bold; font-size: 0.85rem; flex-shrink: 0;">
+                ${(state.profile?.full_name || "Demo User").split(" ").map(n => n[0]).join("").toUpperCase().slice(0, 2)}
+              </div>
+              <div style="display: flex; flex-direction: column; overflow: hidden; flex-grow: 1;">
+                <strong style="font-size: 0.85rem; color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">
+                  ${escapeHtml(state.profile?.full_name || "Demo User")}
+                </strong>
+                <span style="font-size: 0.75rem; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">
+                  ${escapeHtml(state.profile?.email || "demo@irfd.com")}
+                </span>
+              </div>
+              <i data-lucide="chevron-up" style="width: 16px; height: 16px; color: var(--muted);"></i>
+            </button>
+            <div id="profile-dropdown-menu" class="dropdown-menu" style="display: none; position: absolute; bottom: calc(100% - 8px); left: 16px; right: 16px; background: var(--surface-opaque); border: 1px solid var(--line); border-radius: 8px; box-shadow: var(--shadow); z-index: 100; padding: 6px 0;">
+              <a href="#profile" style="display: flex; align-items: center; gap: 8px; padding: 10px 16px; color: var(--ink); text-decoration: none; font-size: 0.85rem; transition: background 0.2s;"><i data-lucide="user" style="width: 16px;"></i><span>Profile</span></a>
+              <a href="#settings" style="display: flex; align-items: center; gap: 8px; padding: 10px 16px; color: var(--ink); text-decoration: none; font-size: 0.85rem; transition: background 0.2s;"><i data-lucide="settings" style="width: 16px;"></i><span>Settings</span></a>
+              <a href="#personalization" style="display: flex; align-items: center; gap: 8px; padding: 10px 16px; color: var(--ink); text-decoration: none; font-size: 0.85rem; transition: background 0.2s;"><i data-lucide="palette" style="width: 16px;"></i><span>Personalization</span></a>
+              <a href="#organization" style="display: flex; align-items: center; gap: 8px; padding: 10px 16px; color: var(--ink); text-decoration: none; font-size: 0.85rem; transition: background 0.2s;"><i data-lucide="building" style="width: 16px;"></i><span>Organization</span></a>
+              <div style="border-top: 1px solid var(--line); margin: 6px 0;"></div>
+              <button type="button" data-action="logout" style="width: 100%; display: flex; align-items: center; gap: 8px; padding: 10px 16px; color: var(--red); background: transparent; border: none; text-align: left; font-size: 0.85rem;"><i data-lucide="log-out" style="width: 16px;"></i><span>Logout</span></button>
             </div>
           </div>
         ` : ""}
@@ -642,7 +712,15 @@ function renderShell() {
               ? renderActivityLog()
               : state.route === "team"
                 ? renderTeamSettings()
-                : renderDashboardView()
+                : state.route === "profile"
+                  ? renderProfileView()
+                  : state.route === "settings"
+                    ? renderSettingsView()
+                    : state.route === "personalization"
+                      ? renderPersonalizationView()
+                      : state.route === "organization"
+                        ? renderOrganizationView()
+                        : renderDashboardView()
         }
       </div>
       ${selectedLead ? renderLeadDetail(selectedLead) : ""}
@@ -1436,6 +1514,38 @@ function bindCommonEvents() {
   document.querySelector("#team-form")?.addEventListener("submit", handleAddStaff);
   document.querySelector("#healing-form")?.addEventListener("submit", handleHealingSubmit);
 
+  document.querySelector("#workspace-select")?.addEventListener("change", async (e) => {
+    state.workspace = e.target.value;
+    localStorage.setItem("irfd.active.workspace", state.workspace);
+    state.busy = true;
+    render();
+    await loadProfile();
+    await loadData();
+    state.busy = false;
+    render();
+  });
+
+  document.querySelector("#profile-menu-toggle")?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const dropdown = document.querySelector("#profile-dropdown-menu");
+    if (dropdown) {
+      const isVisible = dropdown.style.display === "block";
+      dropdown.style.display = isVisible ? "none" : "block";
+    }
+  });
+
+  document.addEventListener("click", () => {
+    const dropdown = document.querySelector("#profile-dropdown-menu");
+    if (dropdown) dropdown.style.display = "none";
+  });
+
+  document.querySelector("#profile-form")?.addEventListener("submit", handleProfileUpdate);
+  document.querySelector("#security-form")?.addEventListener("submit", handleSecurityUpdate);
+  document.querySelector("#personalization-form")?.addEventListener("submit", handlePersonalizationUpdate);
+  document.querySelector("#org-create-form")?.addEventListener("submit", handleOrgCreate);
+  document.querySelector("#org-settings-form")?.addEventListener("submit", handleOrgUpdate);
+  document.querySelector("#org-invite-form")?.addEventListener("submit", handleOrgInvite);
+
   document.querySelectorAll("[data-auth-mode]").forEach((button) => {
     button.addEventListener("click", () => {
       state.authMode = button.dataset.authMode;
@@ -1617,18 +1727,15 @@ async function handleSignUp(event) {
   render();
 
   const form = new FormData(event.currentTarget);
-  const rawEmail = String(form.get("email") || "").trim();
-  const email = rawEmail.includes("@") ? rawEmail : `${rawEmail}@ssmotors.com`;
+  const name = String(form.get("name") || "").trim();
+  const email = String(form.get("email") || "").trim();
   const password = String(form.get("password") || "");
-  const executive = String(form.get("executive") || "").trim();
-  const orgName = String(form.get("orgName") || "").trim();
-  const orgSlug = orgName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "") || `org-${Date.now()}`;
 
   if (!state.client) {
     // Simulate signup successfully if client is not connected
     setTimeout(() => {
       state.busy = false;
-      state.toast = { type: "success", message: `Simulated registration for ${orgName} (${executive}).` };
+      state.toast = { type: "success", message: `Simulated registration for ${name}.` };
       state.authMode = "login";
       render();
     }, 1200);
@@ -1638,7 +1745,12 @@ async function handleSignUp(event) {
   try {
     const { data, error } = await state.client.auth.signUp({
       email,
-      password
+      password,
+      options: {
+        data: {
+          full_name: name
+        }
+      }
     });
 
     if (error) throw error;
@@ -1650,41 +1762,15 @@ async function handleSignUp(event) {
         state.busy = false;
         state.toast = { 
           type: "error", 
-          message: "This username/email is already registered. Please go to the Login tab or choose a different username." 
+          message: "This email is already registered. Please go to the Login tab." 
         };
         render();
         return;
       }
 
-      // 1. Create Organization
-      const { data: orgData, error: orgError } = await state.client
-        .from("organizations")
-        .insert({ name: orgName, slug: orgSlug })
-        .select()
-        .single();
-
-      if (orgError) {
-        if (orgError.code === "23505" || orgError.message.includes("organizations_slug_key")) {
-          throw new Error(`An organization named "${orgName}" already exists. Please choose a different name, or ask your administrator to create a staff account for you.`);
-        }
-        throw orgError;
-      }
-
-      // 2. Create Profile
-      const { error: profileError } = await state.client
-        .from("profiles")
-        .insert({
-          id: user.id,
-          organization_id: orgData.id,
-          role: "admin",
-          full_name: executive
-        });
-
-      if (profileError) throw profileError;
-
       state.busy = false;
       if (data.session) {
-        state.toast = { type: "success", message: "Organization registered successfully!" };
+        state.toast = { type: "success", message: "Registered and logged in successfully!" };
         state.session = data.session;
         state.mode = "app";
         await loadProfile();
@@ -1765,6 +1851,10 @@ async function handleLeadSubmit(event) {
   const form = new FormData(event.currentTarget);
   const payload = extractLeadPayload(form);
   const isNew = state.editingLeadId === "new";
+
+  if (isNew) {
+    payload.organization_id = state.workspace === "personal" ? null : state.workspace;
+  }
 
   if (state.mode === "demo") {
     const leadId = isNew ? crypto.randomUUID() : state.editingLeadId;
@@ -2194,3 +2284,538 @@ async function handleHealingSubmit(event) {
     render();
   }
 }
+
+/* --- SPA Settings & Profile Views --- */
+
+function renderProfileView() {
+  const prof = state.profile || { full_name: "Demo User", username: "demouser", email: "demo@irfd.com", avatar_url: "" };
+  return `
+    <div class="reports-container" style="display: grid; grid-template-columns: 1fr 1fr; gap: 24px; align-items: start;">
+      <section class="table-surface" style="margin: 0; padding: 24px;">
+        <div class="table-toolbar" style="border-bottom: 1px solid var(--border-color); margin-bottom: 20px; padding-bottom: 12px;">
+          <div>
+            <h2>User Profile</h2>
+            <p>Manage your public identity details</p>
+          </div>
+        </div>
+        <form id="profile-form" class="stack-form">
+          <label>
+            <span>Full Name</span>
+            <input name="full_name" type="text" value="${escapeAttribute(prof.full_name)}" required>
+          </label>
+          <label>
+            <span>Username</span>
+            <input name="username" type="text" value="${escapeAttribute(prof.username)}" required>
+          </label>
+          <label>
+            <span>Email Address</span>
+            <input name="email" type="email" value="${escapeAttribute(prof.email)}" required ${state.mode === "demo" ? "" : "disabled"}>
+            ${state.mode === "demo" ? "" : `<span style="font-size: 0.75rem; color: var(--muted); margin-top: 4px;">Email must be updated via Account Settings</span>`}
+          </label>
+          <label>
+            <span>Avatar URL</span>
+            <input name="avatar_url" type="url" value="${escapeAttribute(prof.avatar_url || "")}" placeholder="https://example.com/avatar.png">
+          </label>
+          <button class="primary-btn" type="submit" ${state.busy ? "disabled" : ""} style="margin-top: 10px;">
+            <i data-lucide="save"></i>
+            <span>Save Profile</span>
+          </button>
+        </form>
+      </section>
+      
+      <section class="table-surface" style="margin: 0; padding: 24px; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 300px;">
+        <div class="avatar" style="width: 120px; height: 120px; border-radius: 50%; background: var(--accent-gradient); display: flex; align-items: center; justify-content: center; color: white; font-weight: bold; font-size: 2.5rem; margin-bottom: 16px; box-shadow: var(--accent-glow);">
+          ${(prof.full_name || "Demo User").split(" ").map(n => n[0]).join("").toUpperCase().slice(0, 2)}
+        </div>
+        <h3 style="margin: 0; font-size: 1.25rem;">${escapeHtml(prof.full_name)}</h3>
+        <p style="margin: 4px 0 0; color: var(--muted); font-size: 0.85rem;">@${escapeHtml(prof.username)}</p>
+      </section>
+    </div>
+  `;
+}
+
+async function handleProfileUpdate(event) {
+  event.preventDefault();
+  state.busy = true;
+  state.toast = null;
+  render();
+
+  const form = new FormData(event.currentTarget);
+  const fullName = String(form.get("full_name") || "").trim();
+  const username = String(form.get("username") || "").trim();
+  const avatarUrl = String(form.get("avatar_url") || "").trim();
+
+  if (state.mode === "demo") {
+    state.profile.full_name = fullName;
+    state.profile.username = username;
+    state.profile.avatar_url = avatarUrl;
+    state.busy = false;
+    state.toast = { type: "success", message: "Demo profile updated successfully." };
+    render();
+    return;
+  }
+
+  try {
+    const { error } = await state.client
+      .from("profiles")
+      .update({
+        full_name: fullName,
+        username: username,
+        avatar_url: avatarUrl || null
+      })
+      .eq("id", state.session.user.id);
+
+    if (error) throw error;
+    state.toast = { type: "success", message: "Profile updated successfully!" };
+    await loadProfile();
+  } catch (err) {
+    console.error("Profile update failed:", err);
+    state.toast = { type: "error", message: err.message };
+  } finally {
+    state.busy = false;
+    render();
+  }
+}
+
+function renderSettingsView() {
+  return `
+    <div class="reports-container" style="display: grid; grid-template-columns: 1fr; gap: 24px; max-width: 600px; margin: 0 auto;">
+      <section class="table-surface" style="padding: 24px;">
+        <div class="table-toolbar" style="border-bottom: 1px solid var(--border-color); margin-bottom: 20px; padding-bottom: 12px;">
+          <div>
+            <h2>Account Security</h2>
+            <p>Update your credentials and account password</p>
+          </div>
+        </div>
+        <form id="security-form" class="stack-form">
+          <label>
+            <span>New Password</span>
+            <input name="password" type="password" placeholder="Min. 6 characters" required>
+          </label>
+          <label>
+            <span>Confirm New Password</span>
+            <input name="confirm_password" type="password" placeholder="Min. 6 characters" required>
+          </label>
+          <button class="primary-btn" type="submit" ${state.busy ? "disabled" : ""} style="margin-top: 10px;">
+            <i data-lucide="key-round"></i>
+            <span>Update Password</span>
+          </button>
+        </form>
+      </section>
+    </div>
+  `;
+}
+
+async function handleSecurityUpdate(event) {
+  event.preventDefault();
+  const form = new FormData(event.currentTarget);
+  const password = String(form.get("password") || "");
+  const confirmPassword = String(form.get("confirm_password") || "");
+
+  if (password !== confirmPassword) {
+    state.toast = { type: "error", message: "Passwords do not match." };
+    render();
+    return;
+  }
+
+  state.busy = true;
+  state.toast = null;
+  render();
+
+  if (state.mode === "demo") {
+    setTimeout(() => {
+      state.busy = false;
+      state.toast = { type: "success", message: "Demo password update simulated." };
+      render();
+    }, 800);
+    return;
+  }
+
+  try {
+    const { error } = await state.client.auth.updateUser({ password });
+    if (error) throw error;
+    state.toast = { type: "success", message: "Password updated successfully!" };
+  } catch (err) {
+    console.error("Password update failed:", err);
+    state.toast = { type: "error", message: err.message };
+  } finally {
+    state.busy = false;
+    render();
+  }
+}
+
+function renderPersonalizationView() {
+  const currentTheme = state.theme;
+  const isDark = currentTheme === "dark";
+  return `
+    <div class="reports-container" style="display: grid; grid-template-columns: 1fr; gap: 24px; max-width: 600px; margin: 0 auto;">
+      <section class="table-surface" style="padding: 24px;">
+        <div class="table-toolbar" style="border-bottom: 1px solid var(--border-color); margin-bottom: 20px; padding-bottom: 12px;">
+          <div>
+            <h2>Interface & Preferences</h2>
+            <p>Customize your workspace theme and display preferences</p>
+          </div>
+        </div>
+        <form id="personalization-form" class="stack-form">
+          <label>
+            <span>Visual Theme</span>
+            <select name="theme" style="width: 100%; min-height: 40px; border-radius: 8px; border: 1px solid var(--border-color); background: var(--surface-hover); color: var(--text-main); padding: 0 12px; margin-top: 6px;">
+              <option value="dark" ${isDark ? "selected" : ""}>Dark Mode (Recommended)</option>
+              <option value="light" ${!isDark ? "selected" : ""}>Light Mode</option>
+            </select>
+          </label>
+          <label style="display: flex; flex-direction: row; align-items: center; gap: 10px; margin-top: 16px; cursor: pointer;">
+            <input name="insights" type="checkbox" ${state.insightsExpanded ? "checked" : ""} style="width: 18px; height: 18px; cursor: pointer;">
+            <span>Keep Secondary Metrics panel expanded by default</span>
+          </label>
+          <button class="primary-btn" type="submit" style="margin-top: 20px; width: 100%;">
+            <i data-lucide="sparkles"></i>
+            <span>Apply Preferences</span>
+          </button>
+        </form>
+      </section>
+    </div>
+  `;
+}
+
+function handlePersonalizationUpdate(event) {
+  event.preventDefault();
+  const form = new FormData(event.currentTarget);
+  const selectedTheme = form.get("theme");
+  const insightsCheckbox = form.get("insights") === "on";
+
+  state.theme = selectedTheme;
+  localStorage.setItem(THEME_KEY, state.theme);
+  applyTheme();
+
+  state.insightsExpanded = insightsCheckbox;
+  localStorage.setItem(INSIGHTS_KEY, state.insightsExpanded);
+
+  logActivity("Preferences Changed", "Applied workspace personalization settings.");
+  state.toast = { type: "success", message: "Preferences applied!" };
+  render();
+}
+
+function renderOrganizationView() {
+  const isPersonal = state.workspace === "personal";
+
+  if (isPersonal) {
+    return `
+      <div class="reports-container" style="display: grid; grid-template-columns: 1.2fr 1fr; gap: 24px; align-items: start;">
+        <section class="table-surface" style="margin: 0; padding: 24px;">
+          <div class="table-toolbar" style="border-bottom: 1px solid var(--border-color); margin-bottom: 20px; padding-bottom: 12px;">
+            <div>
+              <h2>Create a New Organization</h2>
+              <p>Launch an isolated workspace and collaborate with your team</p>
+            </div>
+          </div>
+          <form id="org-create-form" class="stack-form">
+            <label>
+              <span>Organization Name</span>
+              <input name="org_name" type="text" placeholder="e.g. Acme Agency" required>
+            </label>
+            <label>
+              <span>Organization Slug (URL identifier)</span>
+              <input name="org_slug" type="text" placeholder="e.g. acme-agency" required>
+            </label>
+            <button class="primary-btn" type="submit" ${state.busy ? "disabled" : ""} style="margin-top: 10px; width: 100%;">
+              <i data-lucide="building-2"></i>
+              <span>Create Organization Workspace</span>
+            </button>
+          </form>
+        </section>
+
+        <section class="table-surface" style="margin: 0; padding: 24px;">
+          <div class="table-toolbar" style="border-bottom: 1px solid var(--border-color); margin-bottom: 20px; padding-bottom: 12px;">
+            <div>
+              <h2>Your Organizations</h2>
+              <p>Switch to collaborate with teammates</p>
+            </div>
+          </div>
+          ${state.organizations.length === 0 ? `
+            <div class="empty-state" style="padding: 20px 0;">
+              <i data-lucide="briefcase"></i>
+              <p>You do not belong to any organizations yet.</p>
+            </div>
+          ` : `
+            <div style="display: flex; flex-direction: column; gap: 12px;">
+              ${state.organizations.map(org => `
+                <div style="display: flex; align-items: center; justify-content: space-between; padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-hover);">
+                  <div>
+                    <strong style="display: block; font-size: 0.9rem;">${escapeHtml(org.name)}</strong>
+                    <span style="font-size: 0.75rem; color: var(--muted);">Role: ${escapeHtml(org.role)}</span>
+                  </div>
+                  <button class="ghost-btn small" type="button" onclick="document.getElementById('workspace-select').value='${org.id}'; document.getElementById('workspace-select').dispatchEvent(new Event('change'))">Switch</button>
+                </div>
+              `).join("")}
+            </div>
+          `}
+        </section>
+      </div>
+    `;
+  }
+
+  // If in an Organization Workspace
+  const activeOrg = state.organizations.find(o => o.id === state.workspace) || { name: "Organization Workspace", slug: "org", role: "Staff Member" };
+  const isAdminOrManager = activeOrg.role === "Admin" || activeOrg.role === "Manager";
+  const members = state.teamProfiles || [];
+
+  return `
+    <div class="reports-container" style="display: grid; grid-template-columns: 1.5fr 1fr; gap: 24px; align-items: start;">
+      <section class="table-surface" style="margin: 0; padding: 24px;">
+        <div class="table-toolbar" style="padding: 0 0 20px; border-bottom: 1px solid var(--border-color); margin-bottom: 20px;">
+          <div>
+            <h2>${escapeHtml(activeOrg.name)} Workspace</h2>
+            <p>Active Workspace Slug: <strong>${escapeHtml(activeOrg.slug)}</strong></p>
+          </div>
+        </div>
+        
+        <div class="table-scroll">
+          <table style="width: 100%;">
+            <thead>
+              <tr>
+                <th>Teammate</th>
+                <th>Email</th>
+                <th>Workspace Role</th>
+                ${isAdminOrManager ? `<th>Actions</th>` : ""}
+              </tr>
+            </thead>
+            <tbody>
+              ${members.map(m => `
+                <tr>
+                  <td><strong>${escapeHtml(m.full_name)}</strong></td>
+                  <td>${escapeHtml(m.email)}</td>
+                  <td>
+                    <span class="priority-pill ${m.role === 'Admin' ? 'high' : m.role === 'Manager' ? 'medium' : 'low'}" style="padding: 3px 8px; font-size: 0.75rem;">
+                      ${escapeHtml(m.role)}
+                    </span>
+                  </td>
+                  ${isAdminOrManager ? `
+                    <td>
+                      ${m.id === state.session.user.id ? `<span style="font-size: 0.75rem; color: var(--muted);">You</span>` : `
+                        <button class="ghost-btn small text-red" type="button" onclick="window.removeOrgMember('${escapeAttribute(m.id)}')"><i data-lucide="user-x"></i>Remove</button>
+                      `}
+                    </td>
+                  ` : ""}
+                </tr>
+              `).join("")}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="table-surface" style="margin: 0; padding: 24px;">
+        <div class="table-toolbar" style="border-bottom: 1px solid var(--border-color); margin-bottom: 20px; padding-bottom: 12px;">
+          <div>
+            <h2>Invite Teammate</h2>
+            <p>Add a new user to this organization</p>
+          </div>
+        </div>
+        ${isAdminOrManager ? `
+          <form id="org-invite-form" class="stack-form">
+            <label>
+              <span>Teammate Full Name</span>
+              <input name="name" type="text" placeholder="e.g. John Doe" required>
+            </label>
+            <label>
+              <span>Email Address</span>
+              <input name="email" type="email" placeholder="e.g. john@example.com" required>
+            </label>
+            <label>
+              <span>Role assignment</span>
+              <select name="role" style="width: 100%; min-height: 40px; border-radius: 8px; border: 1px solid var(--border-color); background: var(--surface-hover); color: var(--text-main); padding: 0 12px; margin-top: 6px;">
+                <option value="Staff Member">Staff Member (Read/Write renewals)</option>
+                <option value="Manager">Manager (Read/Write/Delete, Manage team)</option>
+                <option value="Admin">Admin (Full owner control)</option>
+              </select>
+            </label>
+            <label>
+              <span>Password for initial login</span>
+              <input name="password" type="password" placeholder="Min. 6 characters" required>
+            </label>
+            <button class="primary-btn" type="submit" ${state.busy ? "disabled" : ""} style="margin-top: 15px; width: 100%;">
+              <i data-lucide="user-plus"></i>
+              <span>Invite Teammate</span>
+            </button>
+          </form>
+        ` : `
+          <div class="empty-state" style="padding: 20px 0;">
+            <i data-lucide="shield-alert"></i>
+            <p>Only Admins and Managers can invite new members to this organization workspace.</p>
+          </div>
+        `}
+      </section>
+    </div>
+  `;
+}
+
+async function handleOrgCreate(event) {
+  event.preventDefault();
+  state.busy = true;
+  state.toast = null;
+  render();
+
+  const form = new FormData(event.currentTarget);
+  const name = String(form.get("org_name") || "").trim();
+  const slug = String(form.get("org_slug") || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "") || `org-${Date.now()}`;
+
+  if (state.mode === "demo") {
+    const newOrg = { id: `demo-org-${Date.now()}`, name, slug, role: "Admin" };
+    state.organizations.push(newOrg);
+    state.workspace = newOrg.id;
+    localStorage.setItem("irfd.active.workspace", state.workspace);
+    state.busy = false;
+    state.toast = { type: "success", message: `Demo: Created organization "${name}".` };
+    await loadProfile();
+    await loadData();
+    return;
+  }
+
+  try {
+    // 1. Create Organization
+    const { data: orgData, error: orgError } = await state.client
+      .from("organizations")
+      .insert({ name, slug, owner_id: state.session.user.id })
+      .select()
+      .single();
+
+    if (orgError) {
+      if (orgError.code === "23505" || orgError.message.includes("organizations_slug_key")) {
+        throw new Error(`An organization with slug "${slug}" already exists. Please choose a different slug/name.`);
+      }
+      throw orgError;
+    }
+
+    // 2. Add owner as Admin in organization_members
+    const { error: memberError } = await state.client
+      .from("organization_members")
+      .insert({
+        organization_id: orgData.id,
+        user_id: state.session.user.id,
+        role: "Admin"
+      });
+
+    if (memberError) throw memberError;
+
+    state.workspace = orgData.id;
+    localStorage.setItem("irfd.active.workspace", state.workspace);
+    state.toast = { type: "success", message: `Created organization "${name}" successfully!` };
+    await loadProfile();
+    await loadData();
+  } catch (err) {
+    console.error("Failed to create organization:", err);
+    state.toast = { type: "error", message: err.message };
+  } finally {
+    state.busy = false;
+    render();
+  }
+}
+
+async function handleOrgInvite(event) {
+  event.preventDefault();
+  state.busy = true;
+  state.toast = null;
+  render();
+
+  const form = new FormData(event.currentTarget);
+  const name = String(form.get("name") || "").trim();
+  const email = String(form.get("email") || "").trim();
+  const role = String(form.get("role") || "Staff Member").trim();
+  const password = String(form.get("password") || "");
+
+  if (state.mode === "demo") {
+    setTimeout(() => {
+      state.busy = false;
+      state.teamProfiles.push({
+        id: `demo-user-${Date.now()}`,
+        full_name: name,
+        email: email,
+        role: role,
+        created_at: new Date().toISOString()
+      });
+      state.toast = { type: "success", message: `Demo: Invited teammate ${name} as ${role}.` };
+      render();
+    }, 1000);
+    return;
+  }
+
+  try {
+    // 1. Sign up the new user using a temp client to avoid logging out the current admin
+    const config = getStoredConfig();
+    const tempClient = createClient(config.url, config.anonKey, {
+      auth: { persistSession: false }
+    });
+
+    const { data, error } = await tempClient.auth.signUp({
+      email,
+      password,
+      options: {
+        data: {
+          full_name: name
+        }
+      }
+    });
+
+    if (error) throw error;
+
+    const user = data.user;
+    if (user) {
+      // 2. Add them to organization_members
+      const { error: memberError } = await state.client
+        .from("organization_members")
+        .insert({
+          organization_id: state.workspace,
+          user_id: user.id,
+          role: role,
+          invited_by: state.session.user.id
+        });
+
+      if (memberError) throw memberError;
+
+      state.toast = { type: "success", message: `Invited ${name} to organization successfully!` };
+      await loadProfile();
+    }
+  } catch (err) {
+    console.error("Failed to invite member:", err);
+    state.toast = { type: "error", message: `Failed to invite: ${err.message}` };
+  } finally {
+    state.busy = false;
+    render();
+  }
+}
+
+window.removeOrgMember = async function(userId) {
+  if (!confirm("Are you sure you want to remove this teammate from the organization?")) return;
+
+  state.busy = true;
+  state.toast = null;
+  render();
+
+  if (state.mode === "demo") {
+    state.teamProfiles = state.teamProfiles.filter(t => t.id !== userId);
+    state.busy = false;
+    state.toast = { type: "success", message: "Demo: Member removed." };
+    render();
+    return;
+  }
+
+  try {
+    const { error } = await state.client
+      .from("organization_members")
+      .delete()
+      .eq("organization_id", state.workspace)
+      .eq("user_id", userId);
+
+    if (error) throw error;
+
+    state.toast = { type: "success", message: "Teammate removed successfully." };
+    await loadProfile();
+  } catch (err) {
+    console.error("Failed to remove member:", err);
+    state.toast = { type: "error", message: err.message };
+  } finally {
+    state.busy = false;
+    render();
+  }
+};
+

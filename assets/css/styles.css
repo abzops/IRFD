@@ -1598,3 +1598,15 @@ table .status-pill {
     padding: 20px;
   }
 }
+
+/* SaaS Workspace & Profile Dropdown Styles */
+#profile-dropdown-menu a:hover,
+#profile-dropdown-menu button:hover {
+  background: var(--surface-hover) !important;
+  color: var(--ink) !important;
+}
+#workspace-select:focus {
+  border-color: var(--line-focus);
+  outline: none;
+}
+
