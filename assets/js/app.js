@@ -2247,10 +2247,10 @@ async function handleHealingSubmit(event) {
   const orgSlug = orgName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "") || `org-${Date.now()}`;
 
   try {
-    // 1. Create Organization
+    // 1. Create Organization (explicitly setting owner_id)
     const { data: orgData, error: orgError } = await state.client
       .from("organizations")
-      .insert({ name: orgName, slug: orgSlug })
+      .insert({ name: orgName, slug: orgSlug, owner_id: state.session.user.id })
       .select()
       .single();
 
@@ -2261,18 +2261,32 @@ async function handleHealingSubmit(event) {
       throw orgError;
     }
 
-    // 2. Create Profile
+    // 2. Add owner as Admin in organization_members
+    const { error: memberError } = await state.client
+      .from("organization_members")
+      .insert({
+        organization_id: orgData.id,
+        user_id: state.session.user.id,
+        role: "Admin"
+      });
+
+    if (memberError) throw memberError;
+
+    // 3. Create Profile (with valid fields only)
+    const username = state.session.user.email.split("@")[0] || `user_${Date.now()}`;
     const { error: profileError } = await state.client
       .from("profiles")
-      .insert({
+      .upsert({
         id: state.session.user.id,
-        organization_id: orgData.id,
-        role: "admin",
+        username: username,
+        email: state.session.user.email,
         full_name: name
       });
 
     if (profileError) throw profileError;
 
+    state.workspace = orgData.id;
+    localStorage.setItem("irfd.active.workspace", state.workspace);
     state.toast = { type: "success", message: "Account initialized successfully!" };
     await loadProfile();
     await loadData();
