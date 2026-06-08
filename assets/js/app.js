@@ -478,6 +478,12 @@ function render() {
     return;
   }
 
+  if (state.mode === "app" && !state.profile) {
+    app.innerHTML = renderProfileMissingWarning();
+    bindCommonEvents();
+    return;
+  }
+
   renderShell();
 }
 
@@ -595,6 +601,22 @@ function renderShell() {
             .filter((item) => item.id !== "team" || state.mode === "demo" || (state.profile && state.profile.role === "admin"))
             .map(renderNavItem).join("")}
         </nav>
+        
+        ${state.profile || state.mode === "demo" ? `
+          <div class="sidebar-user" style="margin-top: auto; padding: 16px; border-top: 1px solid var(--border-color); display: flex; align-items: center; gap: 12px;">
+            <div class="avatar" style="width: 36px; height: 36px; border-radius: 50%; background: var(--bg-gradient); display: flex; align-items: center; justify-content: center; color: white; font-weight: bold; font-size: 0.85rem;">
+              ${(state.profile?.full_name || "Demo User").split(" ").map(n => n[0]).join("").toUpperCase().slice(0, 2)}
+            </div>
+            <div style="display: flex; flex-direction: column; overflow: hidden;">
+              <strong style="font-size: 0.85rem; color: var(--text-main); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">
+                ${escapeHtml(state.profile?.full_name || "Demo Administrator")}
+              </strong>
+              <span style="font-size: 0.75rem; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">
+                ${escapeHtml(state.profile?.organizations?.name || "Demo Org")} (${state.profile?.role || "admin"})
+              </span>
+            </div>
+          </div>
+        ` : ""}
       </aside>
       <div class="workspace">
         <header class="topbar">
@@ -1412,6 +1434,7 @@ function bindCommonEvents() {
   document.querySelector("#followup-form")?.addEventListener("submit", handleFollowupSubmit);
   document.querySelector("#lead-form")?.addEventListener("submit", handleLeadSubmit);
   document.querySelector("#team-form")?.addEventListener("submit", handleAddStaff);
+  document.querySelector("#healing-form")?.addEventListener("submit", handleHealingSubmit);
 
   document.querySelectorAll("[data-auth-mode]").forEach((button) => {
     button.addEventListener("click", () => {
@@ -2083,6 +2106,89 @@ async function handleAddStaff(event) {
   } catch (err) {
     console.error("Failed to add staff member:", err);
     state.toast = { type: "error", message: `Failed to add staff: ${err.message}` };
+  } finally {
+    state.busy = false;
+    render();
+  }
+}
+
+function renderProfileMissingWarning() {
+  return `
+    <main class="auth-page">
+      <section class="auth-panel" style="max-width: 450px;">
+        <div class="brand-mark"><img src="./assets/images/logo.png" alt="IRFD Logo"></div>
+        <h1>Setup Administrator Profile</h1>
+        <p class="muted">Your email <strong>${escapeHtml(state.session.user.email)}</strong> is logged in, but not connected to an organization profile yet.</p>
+        
+        ${renderToast()}
+        
+        <form id="healing-form" class="stack-form" style="margin-top: 20px;">
+          <label>
+            <span>Organization Name</span>
+            <input name="healingOrgName" type="text" placeholder="e.g. SS Motors" required>
+          </label>
+          <label>
+            <span>Your Full Name</span>
+            <input name="healingName" type="text" placeholder="e.g. Ravi Kumar" required>
+          </label>
+          <button class="primary-btn" type="submit" ${state.busy ? "disabled" : ""} style="width: 100%; margin-top: 10px;">
+            <i data-lucide="shield-check"></i>
+            <span>${state.busy ? "Saving..." : "Initialize Admin Profile"}</span>
+          </button>
+        </form>
+        
+        <div class="auth-actions" style="margin-top: 20px;">
+          <button class="ghost-btn" type="button" data-action="logout"><i data-lucide="log-out"></i><span>Sign Out</span></button>
+        </div>
+      </section>
+    </main>
+  `;
+}
+
+async function handleHealingSubmit(event) {
+  event.preventDefault();
+  state.busy = true;
+  state.toast = null;
+  render();
+
+  const form = new FormData(event.currentTarget);
+  const orgName = String(form.get("healingOrgName") || "").trim();
+  const name = String(form.get("healingName") || "").trim();
+  const orgSlug = orgName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "") || `org-${Date.now()}`;
+
+  try {
+    // 1. Create Organization
+    const { data: orgData, error: orgError } = await state.client
+      .from("organizations")
+      .insert({ name: orgName, slug: orgSlug })
+      .select()
+      .single();
+
+    if (orgError) {
+      if (orgError.code === "23505" || orgError.message.includes("organizations_slug_key")) {
+        throw new Error(`An organization named "${orgName}" already exists. Please choose a different name.`);
+      }
+      throw orgError;
+    }
+
+    // 2. Create Profile
+    const { error: profileError } = await state.client
+      .from("profiles")
+      .insert({
+        id: state.session.user.id,
+        organization_id: orgData.id,
+        role: "admin",
+        full_name: name
+      });
+
+    if (profileError) throw profileError;
+
+    state.toast = { type: "success", message: "Account initialized successfully!" };
+    await loadProfile();
+    await loadData();
+  } catch (err) {
+    console.error("Self-healing failed:", err);
+    state.toast = { type: "error", message: err.message };
   } finally {
     state.busy = false;
     render();
