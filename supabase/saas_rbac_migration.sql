@@ -138,42 +138,60 @@ for each row execute function public.set_followup_org_id();
 -- ======================================================
 -- 7.5 Helper Functions for Row-Level Security (to prevent recursion)
 -- ======================================================
+drop function if exists public.is_organization_member(uuid, uuid) cascade;
 create or replace function public.is_organization_member(org_id uuid, usr_id uuid)
 returns boolean
-language sql
+language plpgsql
 security definer
 set search_path = public
 as $$
+declare
+  v_exists boolean;
+begin
   select exists (
     select 1 from public.organization_members
     where organization_id = org_id and user_id = usr_id
-  );
+  ) into v_exists;
+  return v_exists;
+end;
 $$;
 
+drop function if exists public.share_organization(uuid, uuid) cascade;
 create or replace function public.share_organization(user_a uuid, user_b uuid)
 returns boolean
-language sql
+language plpgsql
 security definer
 set search_path = public
 as $$
+declare
+  v_exists boolean;
+begin
   select exists (
     select 1 
     from public.organization_members m1
     join public.organization_members m2 on m1.organization_id = m2.organization_id
     where m1.user_id = user_a and m2.user_id = user_b
-  );
+  ) into v_exists;
+  return v_exists;
+end;
 $$;
 
+drop function if exists public.has_org_role(uuid, uuid, text[]) cascade;
 create or replace function public.has_org_role(org_id uuid, usr_id uuid, roles text[])
 returns boolean
-language sql
+language plpgsql
 security definer
 set search_path = public
 as $$
+declare
+  v_exists boolean;
+begin
   select exists (
     select 1 from public.organization_members
     where organization_id = org_id and user_id = usr_id and role = any(roles)
-  );
+  ) into v_exists;
+  return v_exists;
+end;
 $$;
 
 -- ======================================================
