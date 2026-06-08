@@ -302,4 +302,256 @@ grant select, insert, update, delete on public.organizations to authenticated;
 grant select, insert, update, delete on public.profiles to authenticated;
 grant select, insert, update, delete on public.organization_members to authenticated;
 
+-- ======================================================
+-- 10. Recreate Cascaded Views & Functions
+-- ======================================================
+
+create or replace view public.insurance_renewals_enriched
+with (security_invoker = true)
+as
+select
+  r.*,
+  (r.policy_expiry_date - current_date)::int as days_left,
+  case
+    when r.current_status = 'Renewed' then 'Renewed'
+    when r.current_status = 'Lost' then 'Lost'
+    when r.current_status = 'Invalid Data' then 'Closed'
+    when r.policy_expiry_date < current_date then 'Critical'
+    when r.policy_expiry_date <= current_date + interval '7 days' then 'Urgent'
+    when r.policy_expiry_date <= current_date + interval '15 days' then 'High'
+    when r.policy_expiry_date <= current_date + interval '30 days' then 'Medium'
+    else 'Low'
+  end as priority,
+  (
+    r.current_status not in ('Renewed', 'Lost', 'Invalid Data')
+    and r.next_followup_date is null
+  ) as action_missing
+from public.insurance_renewals r;
+
+create or replace view public.renewal_dashboard_counts
+with (security_invoker = true)
+as
+select 'total_renewal_leads' as metric, count(*)::int as value from public.insurance_renewals_enriched
+union all
+select 'expiring_this_month', count(*)::int from public.insurance_renewals_enriched
+where current_status not in ('Renewed', 'Lost', 'Invalid Data')
+and date_trunc('month', policy_expiry_date) = date_trunc('month', current_date)
+union all
+select 'expiring_in_7_days', count(*)::int from public.insurance_renewals_enriched
+where current_status not in ('Renewed', 'Lost', 'Invalid Data') and days_left between 0 and 7
+union all
+select 'followup_due_today', count(*)::int from public.insurance_renewals_enriched
+where current_status not in ('Renewed', 'Lost', 'Invalid Data')
+and (next_followup_date <= current_date or action_missing)
+union all
+select 'quote_sent', count(*)::int from public.insurance_renewals_enriched
+where current_status = 'Quote Sent' or quote_sent_date is not null
+union all
+select 'interested_customers', count(*)::int from public.insurance_renewals_enriched
+where current_status in ('Interested', 'Payment Pending', 'Renewed')
+union all
+select 'not_interested', count(*)::int from public.insurance_renewals_enriched
+where current_status = 'Lost' and (lost_reason = 'Not Interested' or customer_response = 'Not Interested')
+union all
+select 'renewed', count(*)::int from public.insurance_renewals_enriched
+where current_status = 'Renewed'
+union all
+select 'lost', count(*)::int from public.insurance_renewals_enriched
+where current_status = 'Lost'
+union all
+select 'pending_followup', count(*)::int from public.insurance_renewals_enriched
+where current_status not in ('Renewed', 'Lost', 'Invalid Data')
+and current_status in ('Follow-up Pending', 'Quote Sent', 'Interested', 'Not Reachable')
+union all
+select 'action_missing', count(*)::int from public.insurance_renewals_enriched
+where action_missing;
+
+create or replace view public.renewal_today_followups
+with (security_invoker = true)
+as
+select *
+from public.insurance_renewals_enriched
+where current_status not in ('Renewed', 'Lost', 'Invalid Data')
+and (next_followup_date <= current_date or action_missing);
+
+create or replace view public.renewal_expiring_soon
+with (security_invoker = true)
+as
+select *
+from public.insurance_renewals_enriched
+where current_status not in ('Renewed', 'Lost', 'Invalid Data')
+and days_left between 0 and 30;
+
+create or replace view public.renewal_conversion_funnel
+with (security_invoker = true)
+as
+select 1 as sort_order, 'Total Leads' as stage, count(*)::int as count from public.insurance_renewals
+union all
+select 2, 'Contacted', count(*)::int from public.insurance_renewals
+where current_status in ('Contacted', 'Not Reachable', 'Quote Requested', 'Quote Sent', 'Follow-up Pending', 'Interested', 'Payment Pending', 'Renewed', 'Lost')
+union all
+select 3, 'Quote Sent', count(*)::int from public.insurance_renewals
+where current_status in ('Quote Sent', 'Follow-up Pending', 'Interested', 'Payment Pending', 'Renewed') or quote_sent_date is not null
+union all
+select 4, 'Interested', count(*)::int from public.insurance_renewals
+where current_status in ('Interested', 'Payment Pending', 'Renewed')
+union all
+select 5, 'Payment Pending', count(*)::int from public.insurance_renewals
+where current_status in ('Payment Pending', 'Renewed')
+union all
+select 6, 'Renewed', count(*)::int from public.insurance_renewals
+where current_status = 'Renewed'
+order by sort_order;
+
+create or replace view public.renewal_staff_performance
+with (security_invoker = true)
+as
+with call_counts as (
+  select renewal_id, count(*)::int as calls_done
+  from public.renewal_followups
+  where followup_mode = 'Call'
+  group by renewal_id
+)
+select
+  coalesce(r.assigned_executive, 'Unassigned') as executive,
+  count(*)::int as leads_assigned,
+  coalesce(sum(c.calls_done), 0)::int as calls_done,
+  count(*) filter (where r.current_status = 'Quote Sent' or r.quote_sent_date is not null)::int as quotes_sent,
+  count(*) filter (where r.current_status = 'Renewed')::int as renewed,
+  count(*) filter (where r.current_status = 'Lost')::int as lost,
+  round((count(*) filter (where r.current_status = 'Renewed')::numeric / nullif(count(*), 0)) * 100, 0)::int as conversion_percentage
+from public.insurance_renewals r
+left join call_counts c on c.renewal_id = r.id
+group by coalesce(r.assigned_executive, 'Unassigned')
+order by renewed desc, leads_assigned desc;
+
+create or replace view public.renewal_insurer_performance
+with (security_invoker = true)
+as
+select
+  coalesce(current_insurer, 'Unknown') as insurance_company,
+  count(*)::int as leads,
+  count(*) filter (where current_status = 'Quote Sent' or quote_sent_date is not null)::int as quotes_sent,
+  count(*) filter (where current_status = 'Renewed')::int as renewed,
+  round(avg(renewal_quote_amount), 0)::int as avg_premium,
+  round((count(*) filter (where current_status = 'Renewed')::numeric / nullif(count(*), 0)) * 100, 0)::int as conversion_percentage
+from public.insurance_renewals
+group by coalesce(current_insurer, 'Unknown')
+order by renewed desc, leads desc;
+
+create or replace view public.renewal_lost_reason_summary
+with (security_invoker = true)
+as
+select
+  coalesce(lost_reason, 'Unspecified') as lost_reason,
+  count(*)::int as count
+from public.insurance_renewals
+where current_status = 'Lost'
+group by coalesce(lost_reason, 'Unspecified')
+order by count desc;
+
+create or replace view public.renewal_monthly_report
+with (security_invoker = true)
+as
+select
+  to_char(date_trunc('month', coalesce(renewal_date, policy_expiry_date)), 'YYYY-MM') as month,
+  count(*)::int as leads,
+  count(*) filter (where current_status = 'Renewed')::int as renewed,
+  count(*) filter (where current_status = 'Lost')::int as lost,
+  coalesce(sum(renewal_quote_amount) filter (where current_status = 'Renewed'), 0)::numeric(12,2) as premium_total
+from public.insurance_renewals
+group by date_trunc('month', coalesce(renewal_date, policy_expiry_date))
+order by month;
+
+create or replace function public.record_renewal_followup(
+  p_renewal_id uuid,
+  p_followup_date date default current_date,
+  p_followup_by text default null,
+  p_followup_mode text default 'Call',
+  p_current_status text default null,
+  p_customer_response text default null,
+  p_remarks text default null,
+  p_next_action text default null,
+  p_next_followup_date date default null,
+  p_payment_status text default null,
+  p_lost_reason text default null,
+  p_renewal_date date default null
+)
+returns jsonb
+language plpgsql
+security invoker
+set search_path = public
+as $$
+declare
+  v_status text;
+  v_result jsonb;
+begin
+  select coalesce(p_current_status, current_status)
+  into v_status
+  from public.insurance_renewals
+  where id = p_renewal_id;
+
+  if v_status is null then
+    raise exception 'Renewal lead not found';
+  end if;
+
+  insert into public.renewal_followups (
+    renewal_id,
+    followup_date,
+    followup_by,
+    followup_mode,
+    customer_response,
+    remarks,
+    next_action,
+    next_followup_date
+  )
+  values (
+    p_renewal_id,
+    coalesce(p_followup_date, current_date),
+    coalesce(p_followup_by, auth.uid()::text, 'Staff'),
+    coalesce(p_followup_mode, 'Call'),
+    p_customer_response,
+    p_remarks,
+    p_next_action,
+    p_next_followup_date
+  );
+
+  update public.insurance_renewals
+  set
+    current_status = v_status,
+    customer_response = coalesce(p_customer_response, customer_response),
+    remarks = coalesce(p_remarks, remarks),
+    last_followup_date = coalesce(p_followup_date, current_date),
+    next_followup_date = case when v_status in ('Renewed', 'Lost', 'Invalid Data') then null else p_next_followup_date end,
+    payment_status = coalesce(p_payment_status, payment_status),
+    lost_reason = case when v_status = 'Lost' then coalesce(p_lost_reason, lost_reason) else lost_reason end,
+    quote_sent_date = case when v_status = 'Quote Sent' and quote_sent_date is null then coalesce(p_followup_date, current_date) else quote_sent_date end,
+    renewal_date = case when v_status = 'Renewed' then coalesce(p_renewal_date, p_followup_date, current_date) else renewal_date end,
+    closed_at = case when v_status in ('Renewed', 'Lost', 'Invalid Data') then coalesce(closed_at, now()) else null end,
+    updated_by = auth.uid()
+  where id = p_renewal_id;
+
+  select to_jsonb(r)
+  into v_result
+  from public.insurance_renewals_enriched r
+  where r.id = p_renewal_id;
+
+  return v_result;
+end;
+$$;
+
+grant select on
+  public.insurance_renewals_enriched,
+  public.renewal_dashboard_counts,
+  public.renewal_today_followups,
+  public.renewal_expiring_soon,
+  public.renewal_conversion_funnel,
+  public.renewal_staff_performance,
+  public.renewal_insurer_performance,
+  public.renewal_lost_reason_summary,
+  public.renewal_monthly_report
+to authenticated;
+
+grant execute on function public.record_renewal_followup(uuid, date, text, text, text, text, text, text, date, text, text, date) to authenticated;
+
 commit;
