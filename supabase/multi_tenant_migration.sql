@@ -95,10 +95,11 @@ on public.organizations for select
 to authenticated
 using (id = public.get_my_organization_id());
 
+-- Allow anyone to create an organization (required during signup)
 drop policy if exists "Any authenticated user can create an organization" on public.organizations;
-create policy "Any authenticated user can create an organization"
+drop policy if exists "Anyone can create an organization" on public.organizations;
+create policy "Anyone can create an organization"
 on public.organizations for insert
-to authenticated
 with check (true);
 
 -- Profiles Policies
@@ -108,11 +109,12 @@ on public.profiles for select
 to authenticated
 using (organization_id = public.get_my_organization_id());
 
+-- Allow anyone to insert their profile (required during signup)
 drop policy if exists "Users can insert their own profile" on public.profiles;
-create policy "Users can insert their own profile"
+drop policy if exists "Anyone can insert a profile" on public.profiles;
+create policy "Anyone can insert a profile"
 on public.profiles for insert
-to authenticated
-with check (id = auth.uid());
+with check (true);
 
 drop policy if exists "Profiles can be updated by organization admins" on public.profiles;
 create policy "Profiles can be updated by organization admins"
@@ -159,7 +161,7 @@ with check (organization_id = public.get_my_organization_id());
 -- ======================================================
 -- 5. Set up Permissions
 -- ======================================================
-grant select, insert, update on public.organizations to authenticated;
-grant select, insert, update on public.profiles to authenticated;
+grant select, insert, update on public.organizations to authenticated, anon;
+grant select, insert, update on public.profiles to authenticated, anon;
 
 commit;

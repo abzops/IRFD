@@ -1644,11 +1644,16 @@ async function handleSignUp(event) {
       if (profileError) throw profileError;
 
       state.busy = false;
-      state.toast = { type: "success", message: "Organization registered successfully!" };
-      state.session = data.session;
-      state.mode = "app";
-      await loadProfile();
-      await loadData();
+      if (data.session) {
+        state.toast = { type: "success", message: "Organization registered successfully!" };
+        state.session = data.session;
+        state.mode = "app";
+        await loadProfile();
+        await loadData();
+      } else {
+        state.toast = { type: "success", message: "Registration successful! Please check your email to verify your account, then log in." };
+        state.authMode = "login";
+      }
     }
   } catch (error) {
     state.busy = false;
