@@ -218,6 +218,7 @@ drop policy if exists "Only owner can delete organization" on public.organizatio
 
 drop policy if exists "Profiles viewable by self and coworkers" on public.profiles;
 drop policy if exists "Users can update their own profile" on public.profiles;
+drop policy if exists "Users can insert their own profile" on public.profiles;
 
 drop policy if exists "Members list viewable by teammates" on public.organization_members;
 drop policy if exists "Admins/Owners can insert organization members" on public.organization_members;
@@ -270,6 +271,11 @@ create policy "Users can update their own profile"
 on public.profiles for update
 to authenticated
 using (id = auth.uid())
+with check (id = auth.uid());
+
+create policy "Users can insert their own profile"
+on public.profiles for insert
+to authenticated
 with check (id = auth.uid());
 
 -- --- Organization Members Policies ---
