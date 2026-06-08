@@ -90,12 +90,11 @@ for each row execute function public.set_organization_id();
 
 -- Organizations Policies
 drop policy if exists "Organizations are viewable by members" on public.organizations;
-create policy "Organizations are viewable by members"
+drop policy if exists "Organizations are viewable by everyone" on public.organizations;
+create policy "Organizations are viewable by everyone"
 on public.organizations for select
-to authenticated
-using (id = public.get_my_organization_id());
+using (true);
 
--- Allow anyone to create an organization (required during signup)
 drop policy if exists "Any authenticated user can create an organization" on public.organizations;
 drop policy if exists "Anyone can create an organization" on public.organizations;
 create policy "Anyone can create an organization"
@@ -104,12 +103,14 @@ with check (true);
 
 -- Profiles Policies
 drop policy if exists "Profiles are viewable by coworkers" on public.profiles;
-create policy "Profiles are viewable by coworkers"
+drop policy if exists "Profiles are viewable by coworkers or self" on public.profiles;
+create policy "Profiles are viewable by coworkers or self"
 on public.profiles for select
-to authenticated
-using (organization_id = public.get_my_organization_id());
+using (
+  id = auth.uid()
+  or organization_id = public.get_my_organization_id()
+);
 
--- Allow anyone to insert their profile (required during signup)
 drop policy if exists "Users can insert their own profile" on public.profiles;
 drop policy if exists "Anyone can insert a profile" on public.profiles;
 create policy "Anyone can insert a profile"
