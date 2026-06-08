@@ -68,7 +68,8 @@ const state = {
   teamProfiles: [],
   workspace: localStorage.getItem("irfd.active.workspace") || "personal",
   organizations: [],
-  activeOrgRole: null
+  activeOrgRole: null,
+  healingWorkspaceMode: "personal"
 };
 
 // Initial theme application to prevent flash of wrong colors
@@ -1611,6 +1612,11 @@ function bindCommonEvents() {
 
 async function handleAction(event) {
   const action = event.currentTarget.dataset.action;
+  if (action === "set-healing-mode") {
+    state.healingWorkspaceMode = event.currentTarget.dataset.mode;
+    render();
+    return;
+  }
   if (action === "toggle-dev-config") {
     state.showDevConfig = !state.showDevConfig;
     render();
@@ -2203,32 +2209,42 @@ async function handleAddStaff(event) {
 }
 
 function renderProfileMissingWarning() {
+  const showOrg = state.healingWorkspaceMode === "organization";
   return `
     <main class="auth-page">
       <section class="auth-panel" style="max-width: 450px;">
         <div class="brand-mark"><img src="./assets/images/logo.png" alt="IRFD Logo"></div>
-        <h1>Setup Administrator Profile</h1>
-        <p class="muted">Your email <strong>${escapeHtml(state.session.user.email)}</strong> is logged in, but not connected to an organization profile yet.</p>
+        <h1>Setup Your Account</h1>
+        <p class="muted">Your email <strong>${escapeHtml(state.session.user.email)}</strong> is logged in, but your profile is not set up yet.</p>
+        
+        <div class="auth-toggle" style="margin-top: 16px; display: flex; width: 100%; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; margin-bottom: 8px;">
+          <button class="auth-toggle-btn ${!showOrg ? "active" : ""}" type="button" data-action="set-healing-mode" data-mode="personal" style="flex: 1; padding: 10px; border: none; font-weight: 600; font-size: 0.85rem; cursor: pointer; transition: all 0.2s; background: ${!showOrg ? "var(--surface-active)" : "transparent"}; color: ${!showOrg ? "var(--ink)" : "var(--muted)"};">Personal Workspace</button>
+          <button class="auth-toggle-btn ${showOrg ? "active" : ""}" type="button" data-action="set-healing-mode" data-mode="organization" style="flex: 1; padding: 10px; border: none; font-weight: 600; font-size: 0.85rem; cursor: pointer; transition: all 0.2s; background: ${showOrg ? "var(--surface-active)" : "transparent"}; color: ${showOrg ? "var(--ink)" : "var(--muted)"};">Organization Workspace</button>
+        </div>
         
         ${renderToast()}
         
         <form id="healing-form" class="stack-form" style="margin-top: 20px;">
           <label>
-            <span>Organization Name</span>
-            <input name="healingOrgName" type="text" placeholder="e.g. SS Motors" required>
-          </label>
-          <label>
             <span>Your Full Name</span>
             <input name="healingName" type="text" placeholder="e.g. Ravi Kumar" required>
           </label>
-          <button class="primary-btn" type="submit" ${state.busy ? "disabled" : ""} style="width: 100%; margin-top: 10px;">
+          
+          ${showOrg ? `
+            <label>
+              <span>Organization Name</span>
+              <input name="healingOrgName" type="text" placeholder="e.g. SS Motors" required>
+            </label>
+          ` : ""}
+          
+          <button class="primary-btn" type="submit" ${state.busy ? "disabled" : ""} style="width: 100%; margin-top: 15px;">
             <i data-lucide="shield-check"></i>
-            <span>${state.busy ? "Saving..." : "Initialize Admin Profile"}</span>
+            <span>${state.busy ? "Saving..." : "Initialize Workspace"}</span>
           </button>
         </form>
         
-        <div class="auth-actions" style="margin-top: 20px;">
-          <button class="ghost-btn" type="button" data-action="logout"><i data-lucide="log-out"></i><span>Sign Out</span></button>
+        <div class="auth-actions" style="margin-top: 20px; display: flex; justify-content: center; width: 100%;">
+          <button class="ghost-btn" type="button" data-action="logout" style="width: 100%;"><i data-lucide="log-out"></i><span>Sign Out</span></button>
         </div>
       </section>
     </main>
@@ -2242,35 +2258,42 @@ async function handleHealingSubmit(event) {
   render();
 
   const form = new FormData(event.currentTarget);
-  const orgName = String(form.get("healingOrgName") || "").trim();
   const name = String(form.get("healingName") || "").trim();
-  const orgSlug = orgName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "") || `org-${Date.now()}`;
+  const isOrg = state.healingWorkspaceMode === "organization";
+  const orgName = isOrg ? String(form.get("healingOrgName") || "").trim() : "";
+  const orgSlug = orgName ? orgName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "") || `org-${Date.now()}` : "";
 
   try {
-    // 1. Create Organization (explicitly setting owner_id)
-    const { data: orgData, error: orgError } = await state.client
-      .from("organizations")
-      .insert({ name: orgName, slug: orgSlug, owner_id: state.session.user.id })
-      .select()
-      .single();
+    let orgId = null;
 
-    if (orgError) {
-      if (orgError.code === "23505" || orgError.message.includes("organizations_slug_key")) {
-        throw new Error(`An organization named "${orgName}" already exists. Please choose a different name.`);
+    if (isOrg) {
+      // 1. Create Organization (explicitly setting owner_id)
+      const { data: orgData, error: orgError } = await state.client
+        .from("organizations")
+        .insert({ name: orgName, slug: orgSlug, owner_id: state.session.user.id })
+        .select()
+        .single();
+
+      if (orgError) {
+        if (orgError.code === "23505" || orgError.message.includes("organizations_slug_key")) {
+          throw new Error(`An organization named "${orgName}" already exists. Please choose a different name.`);
+        }
+        throw orgError;
       }
-      throw orgError;
+
+      orgId = orgData.id;
+
+      // 2. Add owner as Admin in organization_members
+      const { error: memberError } = await state.client
+        .from("organization_members")
+        .insert({
+          organization_id: orgData.id,
+          user_id: state.session.user.id,
+          role: "Admin"
+        });
+
+      if (memberError) throw memberError;
     }
-
-    // 2. Add owner as Admin in organization_members
-    const { error: memberError } = await state.client
-      .from("organization_members")
-      .insert({
-        organization_id: orgData.id,
-        user_id: state.session.user.id,
-        role: "Admin"
-      });
-
-    if (memberError) throw memberError;
 
     // 3. Create Profile (with valid fields only)
     const username = state.session.user.email.split("@")[0] || `user_${Date.now()}`;
@@ -2285,7 +2308,7 @@ async function handleHealingSubmit(event) {
 
     if (profileError) throw profileError;
 
-    state.workspace = orgData.id;
+    state.workspace = isOrg ? orgId : "personal";
     localStorage.setItem("irfd.active.workspace", state.workspace);
     state.toast = { type: "success", message: "Account initialized successfully!" };
     await loadProfile();
