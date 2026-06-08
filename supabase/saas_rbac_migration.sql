@@ -144,6 +144,35 @@ alter table public.organization_members enable row level security;
 alter table public.insurance_renewals enable row level security;
 alter table public.renewal_followups enable row level security;
 
+-- --- Drop old policies to prevent collision/bypass ---
+drop policy if exists "Authenticated staff can read renewals" on public.insurance_renewals;
+drop policy if exists "Authenticated staff can insert renewals" on public.insurance_renewals;
+drop policy if exists "Authenticated staff can update renewals" on public.insurance_renewals;
+drop policy if exists "Authenticated staff can read followups" on public.renewal_followups;
+drop policy if exists "Authenticated staff can insert followups" on public.renewal_followups;
+
+-- --- Drop new policies if they already exist for idempotence ---
+drop policy if exists "Organizations are viewable by members" on public.organizations;
+drop policy if exists "Anyone authenticated can create an organization" on public.organizations;
+drop policy if exists "Only owner can update organization details" on public.organizations;
+drop policy if exists "Only owner can delete organization" on public.organizations;
+
+drop policy if exists "Profiles viewable by self and coworkers" on public.profiles;
+drop policy if exists "Users can update their own profile" on public.profiles;
+
+drop policy if exists "Members list viewable by teammates" on public.organization_members;
+drop policy if exists "Admins/Owners can insert organization members" on public.organization_members;
+drop policy if exists "Admins/Owners can update organization members" on public.organization_members;
+drop policy if exists "Admins/Owners can delete organization members" on public.organization_members;
+
+drop policy if exists "Select renewals policy" on public.insurance_renewals;
+drop policy if exists "Insert renewals policy" on public.insurance_renewals;
+drop policy if exists "Update renewals policy" on public.insurance_renewals;
+drop policy if exists "Delete renewals policy" on public.insurance_renewals;
+
+drop policy if exists "Select followups policy" on public.renewal_followups;
+drop policy if exists "Insert followups policy" on public.renewal_followups;
+
 -- --- Organizations Policies ---
 create policy "Organizations are viewable by members"
 on public.organizations for select
