@@ -136,6 +136,47 @@ before insert on public.renewal_followups
 for each row execute function public.set_followup_org_id();
 
 -- ======================================================
+-- 7.5 Helper Functions for Row-Level Security (to prevent recursion)
+-- ======================================================
+create or replace function public.is_organization_member(org_id uuid, usr_id uuid)
+returns boolean
+language sql
+security definer
+set search_path = public
+as $$
+  select exists (
+    select 1 from public.organization_members
+    where organization_id = org_id and user_id = usr_id
+  );
+$$;
+
+create or replace function public.share_organization(user_a uuid, user_b uuid)
+returns boolean
+language sql
+security definer
+set search_path = public
+as $$
+  select exists (
+    select 1 
+    from public.organization_members m1
+    join public.organization_members m2 on m1.organization_id = m2.organization_id
+    where m1.user_id = user_a and m2.user_id = user_b
+  );
+$$;
+
+create or replace function public.has_org_role(org_id uuid, usr_id uuid, roles text[])
+returns boolean
+language sql
+security definer
+set search_path = public
+as $$
+  select exists (
+    select 1 from public.organization_members
+    where organization_id = org_id and user_id = usr_id and role = any(roles)
+  );
+$$;
+
+-- ======================================================
 -- 8. Row-Level Security (RLS) Configuration
 -- ======================================================
 alter table public.organizations enable row level security;
@@ -179,7 +220,7 @@ on public.organizations for select
 to authenticated
 using (
   owner_id = auth.uid()
-  or id in (select organization_id from public.organization_members where user_id = auth.uid())
+  or is_organization_member(id, auth.uid())
 );
 
 create policy "Anyone authenticated can create an organization"
@@ -204,11 +245,7 @@ on public.profiles for select
 to authenticated
 using (
   id = auth.uid()
-  or id in (
-    select user_id from public.organization_members where organization_id in (
-      select organization_id from public.organization_members where user_id = auth.uid()
-    )
-  )
+  or share_organization(id, auth.uid())
 );
 
 create policy "Users can update their own profile"
@@ -222,7 +259,7 @@ create policy "Members list viewable by teammates"
 on public.organization_members for select
 to authenticated
 using (
-  organization_id in (select organization_id from public.organization_members where user_id = auth.uid())
+  is_organization_member(organization_id, auth.uid())
   or organization_id in (select id from public.organizations where owner_id = auth.uid())
 );
 
@@ -231,7 +268,7 @@ on public.organization_members for insert
 to authenticated
 with check (
   organization_id in (select id from public.organizations where owner_id = auth.uid())
-  or organization_id in (select organization_id from public.organization_members where user_id = auth.uid() and role = 'Admin')
+  or has_org_role(organization_id, auth.uid(), array['Admin'])
 );
 
 create policy "Admins/Owners can update organization members"
@@ -239,7 +276,7 @@ on public.organization_members for update
 to authenticated
 using (
   organization_id in (select id from public.organizations where owner_id = auth.uid())
-  or organization_id in (select organization_id from public.organization_members where user_id = auth.uid() and role = 'Admin')
+  or has_org_role(organization_id, auth.uid(), array['Admin'])
 );
 
 create policy "Admins/Owners can delete organization members"
@@ -247,7 +284,7 @@ on public.organization_members for delete
 to authenticated
 using (
   organization_id in (select id from public.organizations where owner_id = auth.uid())
-  or organization_id in (select organization_id from public.organization_members where user_id = auth.uid() and role = 'Admin')
+  or has_org_role(organization_id, auth.uid(), array['Admin'])
 );
 
 -- --- Insurance Renewals Policies ---
@@ -257,9 +294,7 @@ to authenticated
 using (
   (organization_id is null and created_by = auth.uid())
   or
-  (organization_id is not null and organization_id in (
-    select organization_id from public.organization_members where user_id = auth.uid()
-  ))
+  (organization_id is not null and is_organization_member(organization_id, auth.uid()))
 );
 
 create policy "Insert renewals policy"
@@ -268,9 +303,7 @@ to authenticated
 with check (
   (organization_id is null and created_by = auth.uid())
   or
-  (organization_id is not null and organization_id in (
-    select organization_id from public.organization_members where user_id = auth.uid()
-  ))
+  (organization_id is not null and is_organization_member(organization_id, auth.uid()))
 );
 
 create policy "Update renewals policy"
@@ -279,16 +312,12 @@ to authenticated
 using (
   (organization_id is null and created_by = auth.uid())
   or
-  (organization_id is not null and organization_id in (
-    select organization_id from public.organization_members where user_id = auth.uid()
-  ))
+  (organization_id is not null and is_organization_member(organization_id, auth.uid()))
 )
 with check (
   (organization_id is null and created_by = auth.uid())
   or
-  (organization_id is not null and organization_id in (
-    select organization_id from public.organization_members where user_id = auth.uid()
-  ))
+  (organization_id is not null and is_organization_member(organization_id, auth.uid()))
 );
 
 create policy "Delete renewals policy"
@@ -297,10 +326,7 @@ to authenticated
 using (
   (organization_id is null and created_by = auth.uid())
   or
-  (organization_id is not null and organization_id in (
-    select organization_id from public.organization_members 
-    where user_id = auth.uid() and role in ('Admin', 'Manager')
-  ))
+  (organization_id is not null and has_org_role(organization_id, auth.uid(), array['Admin', 'Manager']))
 );
 
 -- --- Renewal Follow-ups Policies ---
