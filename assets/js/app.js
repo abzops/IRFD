@@ -492,8 +492,8 @@ function renderAuth() {
         ${isLogin ? `
           <form id="login-form" class="stack-form">
             <label>
-              <span>Email</span>
-              <input name="email" type="email" autocomplete="email" placeholder="agent@irfd.com" required>
+              <span>Username or Email</span>
+              <input name="email" type="text" autocomplete="username" placeholder="e.g. ssmotorsvrk" required>
             </label>
             <label>
               <span>Password</span>
@@ -504,8 +504,8 @@ function renderAuth() {
         ` : `
           <form id="signup-form" class="stack-form">
             <label>
-              <span>Email</span>
-              <input name="email" type="email" placeholder="agent@irfd.com" required>
+              <span>Username or Email</span>
+              <input name="email" type="text" placeholder="e.g. ssmotorsvrk" required>
             </label>
             <label>
               <span>Executive Name</span>
@@ -1523,7 +1523,8 @@ async function handleLogin(event) {
   render();
 
   const form = new FormData(event.currentTarget);
-  const email = String(form.get("email") || "").trim();
+  const rawEmail = String(form.get("email") || "").trim();
+  const email = rawEmail.includes("@") ? rawEmail : `${rawEmail}@ssmotors.com`;
   const password = String(form.get("password") || "");
   const { error } = await state.client.auth.signInWithPassword({ email, password });
 
@@ -1541,7 +1542,8 @@ async function handleSignUp(event) {
   render();
 
   const form = new FormData(event.currentTarget);
-  const email = String(form.get("email") || "").trim();
+  const rawEmail = String(form.get("email") || "").trim();
+  const email = rawEmail.includes("@") ? rawEmail : `${rawEmail}@ssmotors.com`;
   const password = String(form.get("password") || "");
   const executive = String(form.get("executive") || "").trim();
 
