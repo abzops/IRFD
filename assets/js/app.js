@@ -1640,7 +1640,12 @@ async function handleSignUp(event) {
         .select()
         .single();
 
-      if (orgError) throw orgError;
+      if (orgError) {
+        if (orgError.code === "23505" || orgError.message.includes("organizations_slug_key")) {
+          throw new Error(`An organization named "${orgName}" already exists. Please choose a different name, or ask your administrator to create a staff account for you.`);
+        }
+        throw orgError;
+      }
 
       // 2. Create Profile
       const { error: profileError } = await state.client
